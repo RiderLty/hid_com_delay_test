@@ -39,6 +39,27 @@ func main() {
 	timeoutMs := flag.Int("timeout", 2000, "单次等待报告超时 (ms)")
 	wsURL := flag.String("ws", "ws://192.168.73.1:80/ws", "设备 WebSocket 日志地址，用于确定映射模式状态")
 	verbose := flag.Bool("v", false, "打印每个触屏报告的原始内容")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `hid_com_delay_test - pico-hid-mapper 控制链路延迟测试
+
+用法:
+  ./hid_com_delay_test -iface hid -ctrl-vid 2e8a -ctrl-pid c9d0 \
+      -target-vid 035f -target-pid 0ae8 -n 100
+  ./hid_com_delay_test -iface serial -serial /dev/ttyACM0 -baud 921600 \
+      -target-vid 0541 -target-pid 0ce5 -n 100
+
+测量: 上位机写命令帧 → 设备输出触屏 HID 报告的端到端延迟
+      序列为 左按下 → 右按下 → 左松开 → 右松开, 分别统计
+
+前提 (必须):
+  1. 左键与右键都已映射到触屏区域 (左=触点0, 右=触点1)
+  2. 映射类型必须是「同步按下释放」——按下保持、松开释放。
+     连发/单次点击/长按宏等会自动抬手的类型无法测量, 程序自检会报错退出。
+
+参数:
+`)
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	if *iface == "serial" && *serialDev == "" {
@@ -48,6 +69,11 @@ func main() {
 		log.Fatalf("iface=hid 需要用 -ctrl-vid/-ctrl-pid 指定控制 HID 设备")
 	}
 	timeout := time.Duration(*timeoutMs) * time.Millisecond
+
+	fmt.Println("=== pico-hid-mapper 延迟测试 ===")
+	fmt.Println("前提: 左键/右键已映射到触屏区域, 且映射类型为「同步按下释放」")
+	fmt.Println("      (连发/单次点击等自动释放类型会被自检拒绝)")
+	fmt.Println()
 
 	// ---------- 打开触屏设备 (hidraw, 中断 IN 报文) ----------
 	touchDev := findHidrawByUsbId(*targetVID, *targetPID)
@@ -278,6 +304,44 @@ func main() {
 	}
 	fmt.Println("映射模式已开启")
 	time.Sleep(300 * time.Millisecond) // 等设备侧状态稳定
+	touch.drain()
+
+	// ---------- 映射类型自检 ----------
+	// 前提: 左键/右键必须映射为「同步按下释放」(触点跟随按键状态保持按下)，
+	// 不能是连发/单次点击/长按宏等会自动释放的类型——否则测不到「按下→报告」与
+	// 「松开→报告」两个独立边沿 (松开时设备早已自动抬手)。
+	// 自检: 按下左键后不发松开帧，静置 400ms 观察是否自发出现抬起报告。
+	fmt.Println("映射类型自检 (按下左键后静置 400ms，检查是否有自发释放)...")
+	touch.drain()
+	if d, _, _, ok := measure(mouseFrame(0x01, 0, 0), true, 0); ok {
+		fmt.Printf("  左键按下 → 报告 %.3f ms，保持中...\n", float64(d.Nanoseconds())/1e6)
+	} else {
+		log.Fatalf("左键按下 2s 内未收到触屏报告——请检查左键是否已映射到触屏区域")
+	}
+	// 静置期间消费所有报告，出现 tip=0 即为自发释放
+	spontaneous := false
+	hold := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(hold) {
+		rpt, ok := touch.read(time.Until(hold))
+		if !ok {
+			break
+		}
+		if !rpt.tip {
+			spontaneous = true
+			break
+		}
+	}
+	link.Write(mouseFrame(0x00, 0, 0)) // 收尾: 释放左键
+	touch.read(time.Second)
+	touch.drain()
+	if spontaneous {
+		log.Fatalf("检测到自发释放报告: 左键映射类型不是「同步按下释放」" +
+			"(疑似连发/单次点击/长按等会自动抬手的类型)。\n" +
+			"  请在 WebUI 映射配置中改为按下/释放跟随鼠标按键状态的类型后重试，\n" +
+			"  否则无法测量按下与松开两个边沿的延迟。")
+	}
+	fmt.Println("  自检通过: 按下保持不释放 ✓")
+	time.Sleep(100 * time.Millisecond)
 	touch.drain()
 
 	fmtMs := func(d time.Duration, ok bool) string {
