@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,35 +152,86 @@ func main() {
 		}
 	}
 
+	// 排序副本
+	sortedCopy := func(ds []time.Duration) []time.Duration {
+		s := append([]time.Duration(nil), ds...)
+		for i := 1; i < len(s); i++ {
+			for j := i; j > 0 && s[j] < s[j-1]; j-- {
+				s[j], s[j-1] = s[j-1], s[j]
+			}
+		}
+		return s
+	}
+	// 百分位 (0-100)，ds 需已排序
+	percentile := func(sorted []time.Duration, p float64) time.Duration {
+		idx := int(p / 100 * float64(len(sorted)-1))
+		return sorted[idx]
+	}
+
+	// 标准差
+	stddevOf := func(ds []time.Duration, mean time.Duration) float64 {
+		if len(ds) < 2 {
+			return 0
+		}
+		var sumSq float64
+		for _, d := range ds {
+			diff := float64((d - mean).Nanoseconds()) / 1e6
+			sumSq += diff * diff
+		}
+		return math.Sqrt(sumSq / float64(len(ds)-1))
+	}
+
+	// 详细统计: 平均/中位/标准差/百分位/直方图
 	stats := func(name string, ds []time.Duration) {
 		if len(ds) == 0 {
 			fmt.Printf("%s: 无数据\n", name)
 			return
 		}
-		var total, mn, mx time.Duration
-		mn = ds[0]
+		sorted := sortedCopy(ds)
+		var total time.Duration
 		for _, d := range ds {
 			total += d
-			if d < mn {
-				mn = d
+		}
+		mean := total / time.Duration(len(ds))
+		ms := func(d time.Duration) float64 { return float64(d.Nanoseconds()) / 1e6 }
+		fmt.Printf("%s: n=%d\n", name, len(ds))
+		fmt.Printf("  平均 %8.4f | 中位 %8.4f | 标准差 %8.4f\n",
+			ms(mean), ms(percentile(sorted, 50)), stddevOf(ds, mean))
+		fmt.Printf("  最小 %8.4f | P90 %8.4f | P99 %8.4f | 最大 %8.4f\n",
+			ms(sorted[0]), ms(percentile(sorted, 90)), ms(percentile(sorted, 99)), ms(sorted[len(sorted)-1]))
+		// 直方图: 以 0.1ms 为桶
+		fmt.Printf("  直方图 (0.1ms 桶):\n")
+		lo := int(ms(sorted[0]) * 10)
+		hi := int(ms(sorted[len(sorted)-1]) * 10)
+		if hi == lo {
+			hi = lo + 1
+		}
+		const maxBar = 40
+		buckets := make([]int, hi-lo+1)
+		for _, d := range ds {
+			b := int(ms(d)*10) - lo
+			if b < 0 {
+				b = 0
 			}
-			if d > mx {
-				mx = d
+			if b >= len(buckets) {
+				b = len(buckets) - 1
+			}
+			buckets[b]++
+		}
+		peak := 0
+		for _, c := range buckets {
+			if c > peak {
+				peak = c
 			}
 		}
-		sorted := append([]time.Duration(nil), ds...)
-		for i := 1; i < len(sorted); i++ {
-			for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
-				sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		for i, c := range buckets {
+			if c == 0 {
+				continue
 			}
+			w := c * maxBar / peak
+			fmt.Printf("    %5.1f-%5.1f ms | %3d | %s\n",
+				float64(lo+i)/10, float64(lo+i+1)/10, c, strings.Repeat("█", w))
 		}
-		fmt.Printf("%s: 平均 %.6f ms | 中位 %.6f ms | 最小 %.6f ms | 最大 %.6f ms (n=%d)\n",
-			name,
-			float64(total.Nanoseconds())/1e6/float64(len(ds)),
-			float64(sorted[len(sorted)/2].Nanoseconds())/1e6,
-			float64(mn.Nanoseconds())/1e6,
-			float64(mx.Nanoseconds())/1e6,
-			len(ds))
 	}
 
 	// 探测/切换映射模式: 发送 ~ 并监听设备 WS 日志。
