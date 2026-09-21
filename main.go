@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"go.bug.st/serial"
 	"golang.org/x/sys/unix"
 )
@@ -33,7 +34,9 @@ func main() {
 	targetVID := flag.String("target-vid", "0541", "触屏设备 VID, 4 位 hex")
 	targetPID := flag.String("target-pid", "0ce5", "触屏设备 PID, 4 位 hex")
 	iters := flag.Int("n", 100, "测试点击次数")
+	gapMs := flag.Int("gap", 20, "动作间隔 (ms): 按下→抬起、点击→点击之间，过小会拥塞设备输入队列")
 	timeoutMs := flag.Int("timeout", 2000, "单次等待报告超时 (ms)")
+	wsURL := flag.String("ws", "ws://192.168.73.1:80/ws", "设备 WebSocket 日志地址，用于确定映射模式状态")
 	verbose := flag.Bool("v", false, "打印每个触屏报告的原始内容")
 	flag.Parse()
 
@@ -82,6 +85,11 @@ func main() {
 	}
 	defer link.Close()
 
+	// ---------- WebSocket 日志监听 (用于确定映射模式状态) ----------
+	ws := startWsWatcher(*wsURL)
+	defer ws.Close()
+	fmt.Printf("WS 日志: %s\n", *wsURL)
+
 	// ---------- 协议帧构造 ----------
 	// 标准键盘报告 (CMD 0xFD): [modifiers][reserved][keys[6]]
 	keyboardFrame := func(keys ...byte) []byte {
@@ -111,11 +119,15 @@ func main() {
 	}
 
 	// ---------- 测量 ----------
-	// 写入一帧并等待匹配的触屏报告，超时返回 false。
-	// down 匹配 tip=true 且 pressure=255 (排除 tip=true p=0 的 MOVE 报告)；
-	// up 匹配 tip=false (映射开启时抬起报告的特征)。
-	// 早于 500µs 的匹配是上一轮延迟到达的残留报告 (USB 轮询决定了真实延迟 ≥ ~0.9ms)，丢弃。
-	measure := func(frame []byte, wantDown bool) (time.Duration, uint32, uint32, bool) {
+	// 写入一帧并等待指定触点的匹配报告，超时返回 false。
+	// 多触点场景 (左右键映射到两个触点): 左键=触点0, 右键=触点1 (按下顺序决定 slot)。
+	// down 匹配 tip=true 且 pressure=255 且触点 ID 相符；up 匹配 tip=false 且 ID 相符。
+	// ID 不符的报告 (另一触点的状态同步/残留) 跳过。
+	// 写入前清空缓冲: 设备每个动作会发重复报告，匹配到第一条即返回，剩余的会
+	// 积压在 hidraw 环形缓冲 (仅 64 条)，积满后内核静默丢弃新报告 → 假超时。
+	// 早于 500µs 的匹配是残留报告 (USB 轮询决定了真实延迟 ≥ ~0.9ms)，丢弃。
+	measure := func(frame []byte, wantDown bool, wantID uint8) (time.Duration, uint32, uint32, bool) {
+		touch.drain()
 		if err := link.Write(frame); err != nil {
 			log.Printf("写入失败: %v", err)
 			return 0, 0, 0, false
@@ -127,12 +139,15 @@ func main() {
 			if !ok {
 				return 0, 0, 0, false
 			}
-			match := rpt.tip == wantDown && (!wantDown || rpt.pressure == 255)
+			match := rpt.tip == wantDown && rpt.id == wantID && (!wantDown || rpt.pressure == 255)
 			if match && rpt.at.Sub(t0) >= 500*time.Microsecond {
-				touch.drain() // 一个动作可能产生多个报告，清掉尾巴
 				return rpt.at.Sub(t0), rpt.x, rpt.y, true
 			}
-			// 不匹配或过快的报告 (残留) 跳过
+			if match {
+				log.Printf("匹配但被残留过滤 (<500µs): id=%d tip=%v 延迟=%.3fms",
+					rpt.id, rpt.tip, float64(rpt.at.Sub(t0).Nanoseconds())/1e6)
+			}
+			// 不匹配或过快的报告 (其他触点的残留/状态同步) 跳过
 		}
 	}
 
@@ -167,65 +182,34 @@ func main() {
 			len(ds))
 	}
 
-	// 角点判定: 光标在左上角时触摸模拟点击的坐标 (X 右原点或固件默认值，
-	// 与任何用户配置的映射区域都不会重叠)
-	const cornerX, cornerY = uint32(2147483646), uint32(0)
-
-	// 探测映射状态: 小步移动鼠标把虚拟光标移到屏幕左上角，然后点击。
-	// 实测报告坐标 (用户配置椭圆区域在 x≈3.5~4亿, y≈16.8~17.2亿):
-	//   映射关 → 触摸模拟鼠标，点击报告坐标 = 光标角点 (2147483646, 0)
-	//   映射开 → 点击走映射配置位置，坐标落在椭圆区域内
-	// 注意: 映射关时抬起报告是 tip=true p=0 (不是 tip=false)，无法用 measure 等待，
-	// 所以抬起帧盲发后直接清缓冲。
-	// 点击 3 次取多数: 上一轮探测迟到的孤立残留报告不会连中 3 次。
-	// 返回: 映射是否开启、探测是否有效、样例坐标 (用于日志)。
-	probeMapping := func() (bool, bool, uint32, uint32) {
-		for i := 0; i < 40; i++ {
-			link.Write(mouseFrame(0, -100, -100))
-			time.Sleep(2 * time.Millisecond)
-		}
-		time.Sleep(100 * time.Millisecond)
-		touch.drain() // 丢弃移动产生的报告
-
-		var onVotes, offVotes int
-		var lastX, lastY uint32
-		for i := 0; i < 3; i++ {
-			_, x, y, ok := measure(mouseFrame(0x01, 0, 0), true) // 点击
-			link.Write(mouseFrame(0x00, 0, 0))                   // 盲发抬起
-			time.Sleep(50 * time.Millisecond)
-			touch.drain()
-			if !ok {
-				continue
-			}
-			lastX, lastY = x, y
-			if x == cornerX && y == cornerY {
-				offVotes++
-			} else {
-				onVotes++
-			}
-		}
-		if onVotes == 0 && offVotes == 0 {
-			return false, false, 0, 0
-		}
-		return onVotes > offVotes, true, lastX, lastY
-	}
-
-	// 切换映射模式并用坐标校验确认。设备侧状态在程序启动前不确定
-	// (上次运行可能未正确关闭)，先探测再决定是否需要发 ~。
+	// 探测/切换映射模式: 发送 ~ 并监听设备 WS 日志。
+	// 固件行为: 映射开时按 ~ → "map off"; 映射关时按 ~ → "map on";
+	// 另外 ~ 在映射关时还会打 "key event with map off" (无切换)。
+	// 所以发一个 ~ 看日志即可确定当前状态，不对再补发一个。
+	// (不再用点击坐标判定——映射关且光标不在角落时的点击坐标与映射开无法区分，
+	//  且探测移动会在映射开时触发视角拖拽 auto release，污染测量。)
 	toggleMapping := func(wantOn bool) bool {
 		for attempt := 0; attempt < 3; attempt++ {
-			isOn, ok, x, y := probeMapping()
-			if ok {
-				if isOn == wantOn {
-					return true
-				}
-				fmt.Printf("当前映射状态: %s (探测点击坐标 %d,%d)，发送 ~ 切换...\n",
-					map[bool]string{true: "开启", false: "关闭"}[isOn], x, y)
-			} else {
-				fmt.Println("探测无响应，发送 ~ 尝试切换...")
-			}
+			ws.drain()
 			sendKey(KeyGrave)
-			time.Sleep(300 * time.Millisecond)
+			state, ok := ws.waitMapState(2 * time.Second)
+			if !ok {
+				fmt.Println("未收到映射状态日志 (WS 断连?)，重试...")
+				continue
+			}
+			if state == wantOn {
+				fmt.Printf("映射模式已确认: %s\n", map[bool]string{true: "开启", false: "关闭"}[state])
+				return true
+			}
+			// 状态反了 (刚才的 ~ 把状态切过去了)，再发一次切回来
+			fmt.Printf("映射状态为 %s，再发 ~ 切换...\n", map[bool]string{true: "开启", false: "关闭"}[state])
+			ws.drain()
+			sendKey(KeyGrave)
+			state, ok = ws.waitMapState(2 * time.Second)
+			if ok && state == wantOn {
+				fmt.Printf("映射模式已确认: %s\n", map[bool]string{true: "开启", false: "关闭"}[state])
+				return true
+			}
 		}
 		return false
 	}
@@ -250,32 +234,49 @@ func main() {
 		}
 		return fmt.Sprintf("%10.6f ms", float64(d.Nanoseconds())/1e6)
 	}
-	var downLat, upLat []time.Duration
-	var downMiss, upMiss int
+
+	// 左右交替测试: 左按下 → 右按下 → 左松开 → 右松开。
+	// buttons 为位掩码状态，每步只产生一个按钮边沿:
+	//   0x01 (左按下) → 0x03 (加右按下) → 0x02 (左松开) → 0x00 (右松开)
+	// 触点 ID 按按下顺序分配: 左键先按下 → 触点0，右键 → 触点1
+	type stepStat struct {
+		name string
+		lat  []time.Duration
+		miss int
+	}
+	steps := [4]*stepStat{
+		{name: "左键按下"}, {name: "右键按下"}, {name: "左键松开"}, {name: "右键松开"},
+	}
+	gap := time.Duration(*gapMs) * time.Millisecond
 	for i := 1; i <= *iters; i++ {
-		// 单次重试: 设备偶发拥塞丢帧时补测，避免统计样本缺失
-		d, _, _, okD := measure(mouseFrame(0x01, 0, 0), true) // 左键按下
-		if !okD {
-			d, _, _, okD = measure(mouseFrame(0x01, 0, 0), true)
+		seq := []struct {
+			buttons  byte
+			wantDown bool
+			wantID   uint8
+			stat     *stepStat
+		}{
+			{0x01, true, 0, steps[0]},  // 左按下 → 触点0
+			{0x03, true, 1, steps[1]},  // 右按下 (左保持) → 触点1
+			{0x02, false, 0, steps[2]}, // 左松开 (右保持) → 触点0
+			{0x00, false, 1, steps[3]}, // 右松开 → 触点1
 		}
-		u, _, _, okU := measure(mouseFrame(0x00, 0, 0), false) // 左键抬起
-		if !okU {
-			u, _, _, okU = measure(mouseFrame(0x00, 0, 0), false)
+		var results [4]time.Duration
+		var oks [4]bool
+		for k, s := range seq {
+			results[k], _, _, oks[k] = measure(mouseFrame(s.buttons, 0, 0), s.wantDown, s.wantID)
+			if !oks[k] {
+				s.stat.miss++
+			} else {
+				s.stat.lat = append(s.stat.lat, results[k])
+			}
+			if k < len(seq)-1 {
+				time.Sleep(gap)
+			}
 		}
-		if !okD {
-			downMiss++
-		}
-		if !okU {
-			upMiss++
-		}
-		if okD {
-			downLat = append(downLat, d)
-		}
-		if okU {
-			upLat = append(upLat, u)
-		}
-		fmt.Printf("[%03d] 按下: %s | 抬起: %s\n", i, fmtMs(d, okD), fmtMs(u, okU))
-		time.Sleep(5 * time.Millisecond) // 间隔过小会让设备输入队列拥塞丢帧
+		fmt.Printf("[%03d] 左按: %s | 右按: %s | 左松: %s | 右松: %s\n",
+			i, fmtMs(results[0], oks[0]), fmtMs(results[1], oks[1]),
+			fmtMs(results[2], oks[2]), fmtMs(results[3], oks[3]))
+		time.Sleep(gap)
 	}
 
 	fmt.Println("关闭映射模式...")
@@ -288,12 +289,16 @@ func main() {
 	}
 
 	fmt.Println("\n===== 统计 =====")
-	stats("左键按下→触屏报告", downLat)
-	stats("左键抬起→触屏报告", upLat)
-	all := append(downLat, upLat...)
-	stats("整体           ", all)
-	if downMiss > 0 || upMiss > 0 {
-		fmt.Printf("失败次数: 按下 %d, 抬起 %d (已重试)\n", downMiss, upMiss)
+	var all []time.Duration
+	totalMiss := 0
+	for _, s := range steps {
+		stats(s.name+"→触屏报告", s.lat)
+		all = append(all, s.lat...)
+		totalMiss += s.miss
+	}
+	stats("整体             ", all)
+	if totalMiss > 0 {
+		fmt.Printf("失败次数: %d\n", totalMiss)
 	}
 	fmt.Println("测试完成。")
 }
@@ -373,6 +378,122 @@ func (h *hidLink) Write(b []byte) error {
 
 func (h *hidLink) Close() error { return h.f.Close() }
 
+// ---------- WebSocket 日志监听 ----------
+
+// wsWatcher 连接设备 WebSocket 日志通道，把日志行送入 channel。
+// 固件在 ~ 按下时输出 "map on (switch key 53)" / "map off (switch key 53)"，
+// 用来可靠地确定映射模式状态 (映射已关时按 ~ 输出 "key event with map off"，
+// 只有真的切换才输出 map on/off)。
+type wsWatcher struct {
+	url    string
+	logs   chan string
+	done   chan struct{}
+	closed chan struct{}
+}
+
+func startWsWatcher(url string) *wsWatcher {
+	w := &wsWatcher{
+		url:    url,
+		logs:   make(chan string, 256),
+		done:   make(chan struct{}),
+		closed: make(chan struct{}),
+	}
+	go w.run()
+	return w
+}
+
+func (w *wsWatcher) run() {
+	defer close(w.closed)
+	// 自动重连，日志通道断了不影响测试 (只是拿不到状态)
+	for {
+		select {
+		case <-w.done:
+			return
+		default:
+		}
+		c, _, err := websocket.DefaultDialer.Dial(w.url, nil)
+		if err != nil {
+			select {
+			case <-w.done:
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		for {
+			_, msg, err := c.ReadMessage()
+			if err != nil {
+				c.Close()
+				break
+			}
+			select {
+			case w.logs <- string(msg):
+			case <-w.done:
+				c.Close()
+				return
+			default: // channel 满则丢弃旧日志
+				select {
+				case <-w.logs:
+				default:
+				}
+				w.logs <- string(msg)
+			}
+		}
+	}
+}
+
+func (w *wsWatcher) Close() {
+	close(w.done)
+	<-w.closed
+}
+
+// 清空积压日志
+func (w *wsWatcher) drain() {
+	for {
+		select {
+		case <-w.logs:
+		default:
+			return
+		}
+	}
+}
+
+// 等待映射切换日志。固件在 ~ 按下时先打 "key event with map off (53,1)" (旧状态)，
+// 真正切换后才打 "map on (switch key 53)" / "map off (switch key 53)"。
+// 所以忽略 key event 行，只认 switch 行; 收到后再等 150ms 吸收同批日志，取最后一条。
+func (w *wsWatcher) waitMapState(timeout time.Duration) (bool, bool) {
+	deadline := time.After(timeout)
+	var state, got bool
+	for {
+		select {
+		case <-deadline:
+			return state, got
+		case msg := <-w.logs:
+			if strings.Contains(msg, "map on (switch") {
+				state, got = true, true
+			} else if strings.Contains(msg, "map off (switch") {
+				state, got = false, true
+			}
+			if got {
+				// 再等 150ms 看是否有同批的后续 switch 行 (不应有，保守处理)
+				late := time.After(150 * time.Millisecond)
+				for {
+					select {
+					case <-late:
+						return state, true
+					case msg := <-w.logs:
+						if strings.Contains(msg, "map on (switch") {
+							state = true
+						} else if strings.Contains(msg, "map off (switch") {
+							state = false
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 // ---------- 触屏报告读取 (hidraw) ----------
 
 // 触屏报告布局 (Report ID 1, 13 字节):
@@ -394,6 +515,8 @@ type touchReader struct {
 	f       *os.File
 	fd      int
 	verbose bool
+	ch      chan touchReport // 专用读取 goroutine 持续投递
+	done    chan struct{}
 }
 
 func openTouch(dev string) (*touchReader, error) {
@@ -403,16 +526,27 @@ func openTouch(dev string) (*touchReader, error) {
 	}
 	fd := int(f.Fd())
 	unix.SetNonblock(fd, true) // 统一走 select + 原始 read
-	return &touchReader{f: f, fd: fd}, nil
+	t := &touchReader{f: f, fd: fd, ch: make(chan touchReport, 1024), done: make(chan struct{})}
+	go t.readLoop()
+	return t, nil
 }
 
-func (t *touchReader) close() { t.f.Close() }
+func (t *touchReader) close() {
+	close(t.done)
+	t.f.Close()
+}
 
-// 带超时读取一个触屏报告
-func (t *touchReader) read(timeout time.Duration) (touchReport, bool) {
-	deadline := time.Now().Add(timeout)
+// 专用读取 goroutine: 持续读取 hidraw 报告并投递到 channel。
+// 不能只在测量窗口内读——报告会在 hidraw 环形缓冲 (64 条) 中积压，
+// 设备发的重复报告将其填满后内核会静默丢弃新报告。
+func (t *touchReader) readLoop() {
 	buf := make([]byte, 64)
 	for {
+		select {
+		case <-t.done:
+			return
+		default:
+		}
 		n, err := unix.Read(t.fd, buf)
 		if n > 0 {
 			if rpt, ok := parseTouchReport(buf[:n]); ok {
@@ -421,32 +555,49 @@ func (t *touchReader) read(timeout time.Duration) (touchReport, bool) {
 						rpt.raw, rpt.tip, rpt.id, rpt.pressure, rpt.x, rpt.y, rpt.count)
 				}
 				rpt.at = time.Now()
-				return rpt, true
+				select {
+				case t.ch <- rpt:
+				case <-t.done:
+					return
+				default: // channel 满则丢弃最旧报告
+					select {
+					case <-t.ch:
+					default:
+					}
+					t.ch <- rpt
+				}
 			}
-			// 非触屏报告 ID，继续读
+			continue
 		}
 		if err != nil && err != unix.EAGAIN {
-			return touchReport{}, false
-		}
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			return touchReport{}, false
+			return
 		}
 		var rfds unix.FdSet
 		rfds.Set(t.fd)
-		tv := unix.NsecToTimeval(remain.Nanoseconds())
-		nr, serr := unix.Select(t.fd+1, &rfds, nil, nil, &tv)
-		if serr != nil || nr == 0 {
-			return touchReport{}, false
+		tv := unix.NsecToTimeval(int64(50 * time.Millisecond))
+		_, serr := unix.Select(t.fd+1, &rfds, nil, nil, &tv)
+		if serr != nil && serr != unix.EINTR {
+			return
 		}
 	}
 }
 
-// 清空接收缓冲中的残留报告
+// 带超时读取一个触屏报告 (从 channel 消费)
+func (t *touchReader) read(timeout time.Duration) (touchReport, bool) {
+	select {
+	case rpt := <-t.ch:
+		return rpt, true
+	case <-time.After(timeout):
+		return touchReport{}, false
+	}
+}
+
+// 清空积压的报告
 func (t *touchReader) drain() {
-	buf := make([]byte, 64)
 	for {
-		if _, err := unix.Read(t.fd, buf); err != nil {
+		select {
+		case <-t.ch:
+		default:
 			return
 		}
 	}

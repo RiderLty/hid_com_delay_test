@@ -35,14 +35,15 @@ pico-hid-mapper HIDAPI frames (see `../pico-hid-mapper-doc/api/hid-api.md`): `[0
 
 ## Test flow (in `main()`)
 
-1. Open touch hidraw (non-blocking fd + `select` loop in `touchReader`) and the control link (`cmdLink`: `serialLink` | `hidLink`).
-2. Toggle mapping mode ON with `~`, **verified by coordinates**: move the virtual cursor to the top-left corner with small 0xFE moves, click, and read the reported touch position. Mapping OFF → click lands at the corner sentinel `(2147483646, 0)`; mapping ON → click lands inside the user-configured (elliptical) mapping region. Probe clicks 3× and takes the majority, because late reports from a previous probe can pollute the next one.
-3. Measure 100 clicks (down + up): latency = hidraw read return time − write completion time. `measure` filters stale reports: down must match `tip=1 && pressure=255` (MOVE reports are `tip=1 p=0`), up must match `tip=0`, and matches arriving <500µs after the write are discarded (USB polling makes real latency ≥ ~0.9ms). One retry per action on timeout.
-4. Toggle mapping OFF, verified the same way; print avg/median/min/max stats.
+1. Open touch hidraw and the control link (`cmdLink`: `serialLink` | `hidLink`); start a WebSocket log watcher (`wsWatcher`, `-ws` flag).
+2. Toggle mapping mode with `~`, state confirmed via device WS logs: the firmware prints `map on/off (switch key 53)` after the switch, and `key event with map off (53,1)` first (old-state log, must be ignored — only `...(switch...)` lines are authoritative).
+3. Measure `-n` iterations of the alternating pattern: left down → right down → left up → right up. Buttons are a bitmask (`0x01 → 0x03 → 0x02 → 0x00`), each step exactly one button edge. The two buttons map to two touch contacts: left = contact id 0, right = contact id 1 (slot order = press order). Latency = hidraw read time − write completion time, per step, with contact-id-specific matching (down: `tip=1 && pressure=255 && id` matches; up: `tip=0 && id` matches). Matches <500µs after write are discarded as stale.
+4. Toggle mapping OFF, print avg/median/min/max stats per step plus overall.
 
 ## Gotchas
 
-- When mapping is OFF the touch emulation still reports — click reports just carry the cursor-corner sentinel. When mapping is ON, the *up* report is `tip=0`, but when OFF it's `tip=1 p=0` — probe code blind-fires the release frame and drains instead of waiting for it.
-- The X axis in corner reports is the descriptor max (0x7FFFFFFE), suggesting X is right-origin (or it's the firmware default); either way it never collides with a real mapping region.
-- Tight iteration spacing (<5ms) congests the device input queue and drops frames — the loop sleeps 5ms between clicks.
+- **The touch hidraw MUST be read continuously** by a dedicated goroutine (`touchReader.readLoop` → channel), never only inside measurement windows. The kernel hidraw ring buffer per reader is 64 reports; the device sends duplicate reports per action, and reading on-demand lets leftovers accumulate until the buffer silently drops *new* reports — manifests as ~10% phantom timeouts. A standalone experiment (continuous reader) proved the device emits 100% of reports.
+- Do not send mouse *moves* while mapping is ON to "reset the cursor": they trigger the view-drag mapping (`[view] start`), and the idle auto-release (`[view] auto release`) emits tip=0 reports that pollute measurements. Coordinate-based state detection was replaced by WS-log detection for exactly this reason.
+- When mapping is OFF the touch emulation still reports clicks (at the virtual cursor position); when ON, the up report is `tip=0`, when OFF it's `tip=1 p=0`.
+- `time.Sleep` between actions (`-gap`, default 20ms) separates the four steps; too-small gaps congest the device input queue.
 - Chinese is the working language of user-facing output and comments; keep it that way.
