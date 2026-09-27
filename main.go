@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,6 +61,7 @@ func main() {
 	targetPID := flag.String("target-pid", "0ce5", "触屏设备 PID, 4 位 hex")
 	iters := flag.Int("n", 100, "测试点击次数")
 	gapMs := flag.Int("gap", 20, "动作间隔 (ms): 按下→抬起、点击→点击之间，过小会拥塞设备输入队列")
+	gapJitterMs := flag.Int("gap-jitter-ms", 0, "动作间隔随机扰动幅度 (ms): 固定整数 ms 间隔与 USB 1ms 帧网格相位锁定，边沿延迟被钉死在离散步；扰动逐轮重掷相位，测得无锁相位的真实分布")
 	timeoutMs := flag.Int("timeout", 2000, "单次等待报告超时 (ms)")
 	wsURL := flag.String("ws", "ws://192.168.73.1:80/ws", "设备 WebSocket 日志地址，用于确定映射模式状态")
 	verbose := flag.Bool("v", false, "打印每个触屏报告的原始内容")
@@ -400,6 +402,17 @@ func main() {
 		{name: "左键按下"}, {name: "右键按下"}, {name: "左键松开"}, {name: "右键松开"},
 	}
 	gap := time.Duration(*gapMs) * time.Millisecond
+	// 带扰动的间隔睡眠: gap ± gapJitter 均匀抖动。
+	// 固定整数 ms 间隔是 USB 1ms 帧的整数倍，整轮时序相位锁定，每个边沿的延迟
+	// 被钉死在某个离散步（偶发 core0 抖动就整档 +1ms）；扰动逐轮重掷相位。
+	sleepGap := func() {
+		j := time.Duration(*gapJitterMs) * time.Millisecond
+		d := gap
+		if j > 0 {
+			d += time.Duration(rand.Int63n(int64(2*j)+1)) - j
+		}
+		time.Sleep(d)
+	}
 	for i := 1; i <= *iters; i++ {
 		seq := []struct {
 			btn      byte
@@ -422,13 +435,13 @@ func main() {
 				s.stat.lat = append(s.stat.lat, results[k])
 			}
 			if k < len(seq)-1 {
-				time.Sleep(gap)
+				sleepGap()
 			}
 		}
 		fmt.Printf("[%03d] 左按: %s | 右按: %s | 左松: %s | 右松: %s\n",
 			i, fmtMs(results[0], oks[0]), fmtMs(results[1], oks[1]),
 			fmtMs(results[2], oks[2]), fmtMs(results[3], oks[3]))
-		time.Sleep(gap)
+		sleepGap()
 	}
 
 	fmt.Println("关闭映射模式...")
