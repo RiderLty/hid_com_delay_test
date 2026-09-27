@@ -61,7 +61,7 @@ func main() {
 	targetPID := flag.String("target-pid", "0ce5", "触屏设备 PID, 4 位 hex")
 	iters := flag.Int("n", 100, "测试点击次数")
 	gapMs := flag.Int("gap", 20, "动作间隔 (ms): 按下→抬起、点击→点击之间，过小会拥塞设备输入队列")
-	gapJitterMs := flag.Int("gap-jitter-ms", 0, "动作间隔随机扰动幅度 (ms): 固定整数 ms 间隔与 USB 1ms 帧网格相位锁定，边沿延迟被钉死在离散步；扰动逐轮重掷相位，测得无锁相位的真实分布")
+	gapJitterMs := flag.Int("gap-jitter-ms", 0, "动作间隔随机扰动幅度 (ms): 固定整数 ms 间隔与 USB 1ms 帧网格相位锁定，边沿延迟被钉死在离散步；扰动逐轮重掷相位，测得无锁相位的真实分布。注意扰动必须是亚毫秒粒度才有效——上一报告的到达时刻本身锁在轮询网格上，整数 ms 的扰动会被网格吸收")
 	timeoutMs := flag.Int("timeout", 2000, "单次等待报告超时 (ms)")
 	wsURL := flag.String("ws", "ws://192.168.73.1:80/ws", "设备 WebSocket 日志地址，用于确定映射模式状态")
 	verbose := flag.Bool("v", false, "打印每个触屏报告的原始内容")
@@ -402,14 +402,15 @@ func main() {
 		{name: "左键按下"}, {name: "右键按下"}, {name: "左键松开"}, {name: "右键松开"},
 	}
 	gap := time.Duration(*gapMs) * time.Millisecond
-	// 带扰动的间隔睡眠: gap ± gapJitter 均匀抖动。
-	// 固定整数 ms 间隔是 USB 1ms 帧的整数倍，整轮时序相位锁定，每个边沿的延迟
-	// 被钉死在某个离散步（偶发 core0 抖动就整档 +1ms）；扰动逐轮重掷相位。
+	// 带扰动的间隔睡眠: gap ± gapJitter 均匀抖动，**µs 级粒度**。
+	// 固定间隔下整条链路（报告到达→写→CH343→设备武装→IN 轮询）逐级量化到同一个
+	// 1ms 网格，相位锁定；且上一报告的到达时刻本身就落在网格上，整数 ms 的扰动
+	// 会被原样吸收——必须亚毫秒扰动才能真正重掷相位。
 	sleepGap := func() {
-		j := time.Duration(*gapJitterMs) * time.Millisecond
+		j := *gapJitterMs * 1000 // µs
 		d := gap
 		if j > 0 {
-			d += time.Duration(rand.Int63n(int64(2*j)+1)) - j
+			d += time.Duration(rand.Int63n(int64(2*j)+1)) - time.Duration(j)
 		}
 		time.Sleep(d)
 	}
