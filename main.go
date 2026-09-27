@@ -17,18 +17,42 @@ import (
 )
 
 // pico-hid-mapper 延迟测试工具
-// 协议 (../pico-hid-mapper-doc/api/hid-api.md):
-//   命令帧: [0x55][0xAA][LEN:u8][CMD:u8][payload...]，LEN = 1 + payload 长度，多字节小端
+//
+// 三条控制路径（固件侧最终都汇到 core_input_keyboard / core_input_mouse_button）：
+//   1. hurra 标准（串口 2M，TinyFrame 帧）：TYPE_BTN_LEFT/RIGHT (0x20/0x21) [state]、
+//      TYPE_KB_DOWN/UP (0x40/0x41) [key] —— 注入路径（input_filter_inject_*，过授权门控）
+//   2. hurra 扩展 VCTRL（串口 2M，TF type 0xC0）：payload [0xFC][0xFE][btn][down] /
+//      [0xFC][0xFC][key][down] —— 固件重组 55 AA 帧重放 handle_control_frame（无授权门控）
+//   3. HID（PIO vendor HID OUT，55 AA 帧）：CMD 0xFD 键盘 / 0xFE 鼠标 —— hid_dispatch_*
+//
+// TinyFrame 线上格式: [ID:1][LEN:1][TYPE:1][头CRC16:2 BE][载荷:LEN][数据CRC16:2 BE]
+// （CRC poly 0x8005 反射、初值 0；无 SOF 字节；LEN==0 帧到头 CRC 为止）
+//
 // 触屏报告 (Report ID 1, 13 字节):
 //   [01][tip:1bit|pad:7][contact_id:u8][pressure:u8][X:u32 LE][Y:u32 LE][count:u8]
 
 const KeyGrave = 0x35 // ~ 键，切换映射模式
 
+// ---------- Hurra TYPE 常量（对齐 src/hurra.c 枚举） ----------
+
+const (
+	tfTypeVersion = 0x01
+	tfTypeBtnLeft = 0x20 // 0x20..0x24 = 左/右/中/后退/前进
+	tfTypeKbDown  = 0x40
+	tfTypeKbUp    = 0x41
+	tfTypeVctrl   = 0xC0 // 私有扩展：载荷 [0xFC][subcmd][args...]
+	vctrlCmdCore  = 0xFC // → handle_control_frame 的 PIO_CMD_CORE_INPUT
+	vctrlSubMouse = 0xFE // core_input_mouse_button(btn, down)
+	vctrlSubKbd   = 0xFC // core_input_keyboard(key, down)
+	hurraIdentity = "kmbox: Hurra v1"
+)
+
 func main() {
 	// ---------- 命令行参数 ----------
 	iface := flag.String("iface", "serial", "控制接口: serial | hid")
+	proto := flag.String("proto", "hurra", "串口协议 (仅 iface=serial 有效): hurra 标准 | vctrl 扩展")
 	serialDev := flag.String("serial", "", "串口设备路径 (iface=serial 必填, 如 /dev/ttyACM0)")
-	baud := flag.Int("baud", 921600, "串口波特率")
+	baud := flag.Int("baud", 2000000, "串口波特率 (固件固定 2M, 0x05 BAUD 命令只回 ACK 不改速)")
 	ctrlVID := flag.String("ctrl-vid", "", "控制 HID 设备 VID, 4 位 hex (iface=hid 必填)")
 	ctrlPID := flag.String("ctrl-pid", "", "控制 HID 设备 PID, 4 位 hex (iface=hid 必填)")
 	reportID := flag.Int("report-id", 0, "控制 HID 写入的报告 ID")
@@ -40,16 +64,20 @@ func main() {
 	wsURL := flag.String("ws", "ws://192.168.73.1:80/ws", "设备 WebSocket 日志地址，用于确定映射模式状态")
 	verbose := flag.Bool("v", false, "打印每个触屏报告的原始内容")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `hid_com_delay_test - pico-hid-mapper 控制链路延迟测试
+		fmt.Fprintf(os.Stderr, `hid_com_delay_test - pico-hid-mapper 控制链路延迟测试 (三路径)
 
 用法:
   ./hid_com_delay_test -iface hid -ctrl-vid 2e8a -ctrl-pid c9d0 \
       -target-vid 035f -target-pid 0ae8 -n 100
-  ./hid_com_delay_test -iface serial -serial /dev/ttyACM0 -baud 921600 \
-      -target-vid 0541 -target-pid 0ce5 -n 100
+  ./hid_com_delay_test -iface serial -proto hurra -serial /dev/serial/by-id/... \
+      -target-vid 0541 -target-pid 0ce5 -n 100     # Hurra 标准命令 (0x20/0x21)
+  ./hid_com_delay_test -iface serial -proto vctrl -serial /dev/serial/by-id/... \
+      -target-vid 0541 -target-pid 0ce5 -n 100     # Hurra VCTRL 扩展 (0xC0)
 
-测量: 上位机写命令帧 → 设备输出触屏 HID 报告的端到端延迟
+测量: 上位机发控制指令 → 设备输出触屏 HID 报告的端到端延迟
       序列为 左按下 → 右按下 → 左松开 → 右松开, 分别统计
+      串口两路径最终入口不同 (hurra=注入路径 / vctrl=控制帧重放), 可对比;
+      HID 与 vctrl 引擎入口相同, 差异只在传输层 (USB OUT vs UART)。
 
 前提 (必须):
   1. 左键与右键都已映射到触屏区域 (左=触点0, 右=触点1)
@@ -62,15 +90,37 @@ func main() {
 	}
 	flag.Parse()
 
-	if *iface == "serial" && *serialDev == "" {
-		log.Fatalf("iface=serial 需要用 -serial 指定串口设备路径")
-	}
-	if *iface == "hid" && (*ctrlVID == "" || *ctrlPID == "") {
-		log.Fatalf("iface=hid 需要用 -ctrl-vid/-ctrl-pid 指定控制 HID 设备")
+	switch *iface {
+	case "serial":
+		if *serialDev == "" {
+			log.Fatalf("iface=serial 需要用 -serial 指定串口设备路径")
+		}
+		if *proto != "hurra" && *proto != "vctrl" {
+			log.Fatalf("未知串口协议: %s (-proto hurra | vctrl)", *proto)
+		}
+	case "hid":
+		if *ctrlVID == "" || *ctrlPID == "" {
+			log.Fatalf("iface=hid 需要用 -ctrl-vid/-ctrl-pid 指定控制 HID 设备")
+		}
+		if *proto != "hurra" {
+			fmt.Printf("提示: -proto 仅对 iface=serial 有效, HID 路径忽略\n")
+		}
+	default:
+		log.Fatalf("未知控制接口: %s (serial | hid)", *iface)
 	}
 	timeout := time.Duration(*timeoutMs) * time.Millisecond
 
 	fmt.Println("=== pico-hid-mapper 延迟测试 ===")
+	fmt.Printf("控制路径: %s\n", func() string {
+		switch {
+		case *iface == "hid":
+			return "HID (55 AA 控制帧, PIO vendor HID OUT)"
+		case *proto == "hurra":
+			return "Hurra 标准 (TF 0x20/0x21 鼠标按钮, 注入路径)"
+		default:
+			return "Hurra VCTRL 扩展 (TF 0xC0 → 控制帧重放)"
+		}
+	}())
 	fmt.Println("前提: 左键/右键已映射到触屏区域, 且映射类型为「同步按下释放」")
 	fmt.Println("      (连发/单次点击等自动释放类型会被自检拒绝)")
 	fmt.Println()
@@ -92,11 +142,22 @@ func main() {
 	var link cmdLink
 	switch *iface {
 	case "serial":
-		link, err = openSerial(*serialDev, *baud)
+		sl, err := openSerial(*serialDev, *baud, *proto)
 		if err != nil {
 			log.Fatalf("无法打开串口 %s: %v", *serialDev, err)
 		}
-		fmt.Printf("控制接口: 串口 %s @ %d\n", *serialDev, *baud)
+		// 链路自检: VERSION 应答确认对端确实是本固件 (接错口/固件未刷/波特率
+		// 不符时在此给出明确诊断, 而不是测量阶段全部超时)。
+		ident, err := sl.probeVersion()
+		if err != nil {
+			sl.Close()
+			log.Fatalf("串口链路自检失败: %v\n"+
+				"  可能原因: 接错串口 (应为设备 UART, 2M 波特率)、固件未刷 Hurra 版、\n"+
+				"  或串口被其他进程占用", err)
+		}
+		fmt.Printf("控制接口: 串口 %s @ %d (协议 %s)\n", *serialDev, *baud, *proto)
+		fmt.Printf("链路自检: 设备应答 VERSION: %q\n", ident)
+		link = sl
 	case "hid":
 		ctrlDev := findHidrawByUsbId(*ctrlVID, *ctrlPID)
 		if ctrlDev == "" {
@@ -107,8 +168,6 @@ func main() {
 			log.Fatalf("无法打开控制 HID 设备 %s: %v", ctrlDev, err)
 		}
 		fmt.Printf("控制接口: HID %s (report id %d)\n", ctrlDev, *reportID)
-	default:
-		log.Fatalf("未知控制接口: %s (serial | hid)", *iface)
 	}
 	defer link.Close()
 
@@ -117,45 +176,24 @@ func main() {
 	defer ws.Close()
 	fmt.Printf("WS 日志: %s\n", *wsURL)
 
-	// ---------- 协议帧构造 ----------
-	// 标准键盘报告 (CMD 0xFD): [modifiers][reserved][keys[6]]
-	keyboardFrame := func(keys ...byte) []byte {
-		f := []byte{0x55, 0xAA, 0x09, 0xFD, 0x00, 0x00}
-		for i := 0; i < 6; i++ {
-			if i < len(keys) {
-				f = append(f, keys[i])
-			} else {
-				f = append(f, 0)
-			}
-		}
-		return f
-	}
-	// 标准鼠标报告 (CMD 0xFE): [report_id][buttons][x:i16][y:i16][wheel][reserved]
-	mouseFrame := func(buttons byte, dx, dy int16) []byte {
-		f := []byte{0x55, 0xAA, 0x09, 0xFE, 0x00, buttons}
-		f = binary.LittleEndian.AppendUint16(f, uint16(dx))
-		f = binary.LittleEndian.AppendUint16(f, uint16(dy))
-		return append(f, 0, 0) // wheel, reserved
-	}
-
 	// 发送一次按键 (按下 + 释放，产生完整边沿)
 	sendKey := func(keycode byte) {
-		link.Write(keyboardFrame(keycode))
+		link.KeyDown(keycode, true)
 		time.Sleep(20 * time.Millisecond)
-		link.Write(keyboardFrame())
+		link.KeyDown(keycode, false)
 	}
 
 	// ---------- 测量 ----------
-	// 写入一帧并等待指定触点的匹配报告，超时返回 false。
+	// 按下/松开一个鼠标按钮并等待指定触点的匹配报告，超时返回 false。
 	// 多触点场景 (左右键映射到两个触点): 左键=触点0, 右键=触点1 (按下顺序决定 slot)。
 	// down 匹配 tip=true 且 pressure=255 且触点 ID 相符；up 匹配 tip=false 且 ID 相符。
 	// ID 不符的报告 (另一触点的状态同步/残留) 跳过。
 	// 写入前清空缓冲: 设备每个动作会发重复报告，匹配到第一条即返回，剩余的会
 	// 积压在 hidraw 环形缓冲 (仅 64 条)，积满后内核静默丢弃新报告 → 假超时。
 	// 早于 500µs 的匹配是残留报告 (USB 轮询决定了真实延迟 ≥ ~0.9ms)，丢弃。
-	measure := func(frame []byte, wantDown bool, wantID uint8) (time.Duration, uint32, uint32, bool) {
+	measure := func(btn byte, wantDown bool, wantID uint8) (time.Duration, uint32, uint32, bool) {
 		touch.drain()
-		if err := link.Write(frame); err != nil {
+		if err := link.MouseButton(btn, wantDown); err != nil {
 			log.Printf("写入失败: %v", err)
 			return 0, 0, 0, false
 		}
@@ -313,7 +351,7 @@ func main() {
 	// 自检: 按下左键后不发松开帧，静置 400ms 观察是否自发出现抬起报告。
 	fmt.Println("映射类型自检 (按下左键后静置 400ms，检查是否有自发释放)...")
 	touch.drain()
-	if d, _, _, ok := measure(mouseFrame(0x01, 0, 0), true, 0); ok {
+	if d, _, _, ok := measure(0, true, 0); ok {
 		fmt.Printf("  左键按下 → 报告 %.3f ms，保持中...\n", float64(d.Nanoseconds())/1e6)
 	} else {
 		log.Fatalf("左键按下 2s 内未收到触屏报告——请检查左键是否已映射到触屏区域")
@@ -331,7 +369,7 @@ func main() {
 			break
 		}
 	}
-	link.Write(mouseFrame(0x00, 0, 0)) // 收尾: 释放左键
+	link.MouseButton(0, false) // 收尾: 释放左键
 	touch.read(time.Second)
 	touch.drain()
 	if spontaneous {
@@ -352,9 +390,7 @@ func main() {
 	}
 
 	// 左右交替测试: 左按下 → 右按下 → 左松开 → 右松开。
-	// buttons 为位掩码状态，每步只产生一个按钮边沿:
-	//   0x01 (左按下) → 0x03 (加右按下) → 0x02 (左松开) → 0x00 (右松开)
-	// 触点 ID 按按下顺序分配: 左键先按下 → 触点0，右键 → 触点1
+	// 每步只产生一个按钮边沿。触点 ID 按按下顺序分配: 左键先按下 → 触点0，右键 → 触点1
 	type stepStat struct {
 		name string
 		lat  []time.Duration
@@ -366,20 +402,20 @@ func main() {
 	gap := time.Duration(*gapMs) * time.Millisecond
 	for i := 1; i <= *iters; i++ {
 		seq := []struct {
-			buttons  byte
+			btn      byte
 			wantDown bool
 			wantID   uint8
 			stat     *stepStat
 		}{
-			{0x01, true, 0, steps[0]},  // 左按下 → 触点0
-			{0x03, true, 1, steps[1]},  // 右按下 (左保持) → 触点1
-			{0x02, false, 0, steps[2]}, // 左松开 (右保持) → 触点0
-			{0x00, false, 1, steps[3]}, // 右松开 → 触点1
+			{0, true, 0, steps[0]},  // 左按下 → 触点0
+			{1, true, 1, steps[1]},  // 右按下 (左保持) → 触点1
+			{0, false, 0, steps[2]}, // 左松开 (右保持) → 触点0
+			{1, false, 1, steps[3]}, // 右松开 → 触点1
 		}
 		var results [4]time.Duration
 		var oks [4]bool
 		for k, s := range seq {
-			results[k], _, _, oks[k] = measure(mouseFrame(s.buttons, 0, 0), s.wantDown, s.wantID)
+			results[k], _, _, oks[k] = measure(s.btn, s.wantDown, s.wantID)
 			if !oks[k] {
 				s.stat.miss++
 			} else {
@@ -419,6 +455,95 @@ func main() {
 	fmt.Println("测试完成。")
 }
 
+// ---------- TinyFrame 编解码 (对齐 pytester/test_hurra.py) ----------
+
+// 反射逐字节 CRC 表: crc = (crc >> 8) ^ table[(crc ^ byte) & 0xFF]
+// 多项式 0x8005 反射 (0xA001)、初值 0、无 xorout，与 TinyFrame 内置表一致
+var crcTable = func() [256]uint16 {
+	var t [256]uint16
+	for b := 0; b < 256; b++ {
+		crc := uint16(0)
+		c := byte(b)
+		for i := 0; i < 8; i++ {
+			if (crc^uint16(c))&1 != 0 {
+				crc = (crc >> 1) ^ 0xA001
+			} else {
+				crc >>= 1
+			}
+			c >>= 1
+		}
+		t[b] = crc
+	}
+	return t
+}()
+
+func crc16(data []byte) uint16 {
+	var crc uint16
+	for _, b := range data {
+		crc = crc>>8 ^ crcTable[(crc^uint16(b))&0xFF]
+	}
+	return crc
+}
+
+// 帧格式: [ID:1][LEN:1][TYPE:1][头CRC16:2 BE][载荷:LEN][数据CRC16:2 BE]
+// 无 SOF 字节；LEN==0 帧到头 CRC 为止（无数据 CRC）。
+func tfEncode(id, typ byte, payload []byte) []byte {
+	head := []byte{id, byte(len(payload)), typ}
+	hc := crc16(head)
+	out := append(head, byte(hc>>8), byte(hc))
+	if len(payload) > 0 {
+		dc := crc16(payload)
+		out = append(out, payload...)
+		out = append(out, byte(dc>>8), byte(dc))
+	}
+	return out
+}
+
+type tfFrame struct {
+	id, typ byte
+	payload []byte
+}
+
+// 从字节流解 TinyFrame 帧（头 CRC 不匹配时滑窗逐字节重同步——无 SOF 字节的代价）
+type tfParser struct {
+	buf []byte
+}
+
+func (p *tfParser) feed(data []byte) []tfFrame {
+	p.buf = append(p.buf, data...)
+	var out []tfFrame
+	for {
+		if len(p.buf) < 5 {
+			return out
+		}
+		tfLen := p.buf[1]
+		if crc16(p.buf[:3]) != binary.BigEndian.Uint16(p.buf[3:5]) {
+			p.buf = p.buf[1:]
+			continue
+		}
+		frameLen := 5 + int(tfLen)
+		if tfLen > 0 {
+			frameLen += 2
+		}
+		if len(p.buf) < frameLen {
+			return out
+		}
+		frame := p.buf[:frameLen]
+		p.buf = p.buf[frameLen:]
+		var payload []byte
+		if tfLen > 0 {
+			payload = frame[5 : 5+tfLen]
+			if crc16(payload) != binary.BigEndian.Uint16(frame[5+tfLen:7+tfLen]) {
+				continue // 载荷 CRC 错，丢弃该帧继续收
+			}
+		}
+		out = append(out, tfFrame{
+			id: frame[0], typ: frame[2],
+			payload: append([]byte(nil), payload...),
+		})
+	}
+}
+
 // ---------- 设备查找 ----------
 
 // 按 USB VID:PID 查找 /dev/hidraw* (匹配 uevent 中的 HID_ID=bbbb:vvvvvvvv:pppppppp)
@@ -449,32 +574,110 @@ func findHidrawByUsbId(vid, pid string) string {
 
 // ---------- 控制链路 ----------
 
+// 语义化控制接口: 三条路径各自实现线格式编码，测量流程与协议解耦。
 type cmdLink interface {
-	Write([]byte) error
+	// MouseButton 按下/松开一个鼠标按钮 (0..4 = 左/右/中/后退/前进)。
+	MouseButton(btn byte, down bool) error
+	// KeyDown 按下/松开一个键盘键 (HID keycode)。
+	KeyDown(key byte, down bool) error
 	Close() error
 }
 
+// ----- 串口链路 (Hurra / TinyFrame, 固定 2M) -----
+
 type serialLink struct {
-	port serial.Port
+	port   serial.Port
+	proto  string // "hurra" | "vctrl"
+	nextID byte
 }
 
-func openSerial(dev string, baud int) (cmdLink, error) {
+func openSerial(dev string, baud int, proto string) (*serialLink, error) {
 	p, err := serial.Open(dev, &serial.Mode{BaudRate: baud})
 	if err != nil {
 		return nil, err
 	}
-	return &serialLink{port: p}, nil
+	// VERSION 自检要读应答，给 Read 一个短超时（只在自检时读，测量期只写）
+	if err := p.SetReadTimeout(20 * time.Millisecond); err != nil {
+		p.Close()
+		return nil, err
+	}
+	return &serialLink{port: p, proto: proto}, nil
 }
 
-func (s *serialLink) Write(b []byte) error {
-	_, err := s.port.Write(b)
+func (s *serialLink) send(tfType byte, payload []byte) error {
+	s.nextID = (s.nextID + 1) & 0x7F // 对齐参考实现：ID 限 7 位
+	_, err := s.port.Write(tfEncode(s.nextID, tfType, payload))
 	return err
 }
-func (s *serialLink) Close() error         { return s.port.Close() }
+
+// VERSION 链路自检: 发 TYPE_VERSION (0x01)，等固件回 "kmbox: Hurra v1"（应答复用请求 id）
+func (s *serialLink) probeVersion() (string, error) {
+	var p tfParser
+	buf := make([]byte, 256)
+	for attempt := 0; attempt < 3; attempt++ {
+		s.nextID = (s.nextID + 1) & 0x7F
+		id := s.nextID
+		_ = s.port.ResetInputBuffer()
+		if _, err := s.port.Write(tfEncode(id, tfTypeVersion, nil)); err != nil {
+			return "", err
+		}
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			n, err := s.port.Read(buf)
+			if err != nil {
+				return "", err
+			}
+			for _, fr := range p.feed(buf[:n]) {
+				if fr.id == id && fr.typ == tfTypeVersion {
+					return string(fr.payload), nil
+				}
+			}
+		}
+	}
+	return "", fmt.Errorf("3×500ms 内未收到 VERSION 应答")
+}
+
+func (s *serialLink) MouseButton(btn byte, down bool) error {
+	if btn > 4 {
+		return fmt.Errorf("按钮编号越界: %d (0..4)", btn)
+	}
+	d := byte(0)
+	if down {
+		d = 1
+	}
+	if s.proto == "vctrl" {
+		// VCTRL 扩展: TF 0xC0 载荷 [0xFC][0xFE][btn][down] → 控制帧重放 → core_input_mouse_button
+		return s.send(tfTypeVctrl, []byte{vctrlCmdCore, vctrlSubMouse, btn, d})
+	}
+	// Hurra 标准: TF 0x20..0x24 [state]（0x20=左键，编号连续）→ input_filter_inject_button
+	return s.send(tfTypeBtnLeft+btn, []byte{d})
+}
+
+func (s *serialLink) KeyDown(key byte, down bool) error {
+	d := byte(0)
+	if down {
+		d = 1
+	}
+	if s.proto == "vctrl" {
+		// VCTRL 扩展: TF 0xC0 载荷 [0xFC][0xFC][key][down] → core_input_keyboard
+		return s.send(tfTypeVctrl, []byte{vctrlCmdCore, vctrlSubKbd, key, d})
+	}
+	// Hurra 标准: TF 0x40 (KB_DOWN) / 0x41 (KB_UP) [key] → input_filter_inject_key
+	typ := byte(tfTypeKbDown)
+	if !down {
+		typ = tfTypeKbUp
+	}
+	return s.send(typ, []byte{key})
+}
+
+func (s *serialLink) Close() error { return s.port.Close() }
+
+// ----- HID 链路 (PIO vendor HID OUT, 55 AA 帧) -----
 
 type hidLink struct {
 	f        *os.File
 	reportID byte
+	btns     byte // 55 AA 0xFE 是状态型报文（按钮位图），跨调用维护
 }
 
 func openHidLink(dev string, reportID byte) (cmdLink, error) {
@@ -485,11 +688,34 @@ func openHidLink(dev string, reportID byte) (cmdLink, error) {
 	return &hidLink{f: f, reportID: reportID}, nil
 }
 
-// hidraw 写入: 首字节为报告 ID，其后为报告数据
-func (h *hidLink) Write(b []byte) error {
-	buf := append([]byte{h.reportID}, b...)
-	_, err := h.f.Write(buf)
+// 55 AA 帧 + hidraw 报告 ID 前缀
+func (h *hidLink) write(cmd byte, payload []byte) error {
+	f := append([]byte{0x55, 0xAA, byte(len(payload) + 1), cmd}, payload...)
+	_, err := h.f.Write(append([]byte{h.reportID}, f...))
 	return err
+}
+
+func (h *hidLink) MouseButton(btn byte, down bool) error {
+	if btn > 4 {
+		return fmt.Errorf("按钮编号越界: %d (0..4)", btn)
+	}
+	bit := byte(1) << btn
+	if down {
+		h.btns |= bit
+	} else {
+		h.btns &^= bit
+	}
+	// CMD 0xFE 标准鼠标报文 8B: [rid][buttons][dx i16][dy i16][wheel][pan]
+	return h.write(0xFE, []byte{0x00, h.btns, 0, 0, 0, 0, 0, 0})
+}
+
+func (h *hidLink) KeyDown(key byte, down bool) error {
+	var keys [6]byte
+	if down {
+		keys[0] = key
+	}
+	// CMD 0xFD 标准键盘报文 8B: [rid][modifiers][reserved][keys[6]]
+	return h.write(0xFD, []byte{0x00, 0x00, keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]})
 }
 
 func (h *hidLink) Close() error { return h.f.Close() }
@@ -613,8 +839,9 @@ func (w *wsWatcher) waitMapState(timeout time.Duration) (bool, bool) {
 // ---------- 触屏报告读取 (hidraw) ----------
 
 // 触屏报告布局 (Report ID 1, 13 字节):
-//   [0]=0x01 [1]=tip(bit0) [2]=contact_id [3]=pressure
-//   [4:8]=X u32 LE [8:12]=Y u32 LE [12]=contact_count
+//
+//	[0]=0x01 [1]=tip(bit0) [2]=contact_id [3]=pressure
+//	[4:8]=X u32 LE [8:12]=Y u32 LE [12]=contact_count
 const touchReportLen = 13
 
 type touchReport struct {

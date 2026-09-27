@@ -2,7 +2,18 @@
 
 测量 **pico-hid-mapper** (RP2350) 从收到控制指令到输出触屏 HID 报告的端到端延迟。
 
-支持两种控制通道 (串口 / HID)，可对比不同链路的延迟表现。
+支持三条控制路径，可对比不同链路/引擎入口的延迟表现：
+
+| 路径 | 传输 | 线格式 | 固件引擎入口 |
+|------|------|--------|------|
+| **hurra** (`-iface serial -proto hurra`) | 串口 2M | TinyFrame `0x20/0x21` 鼠标按钮、`0x40/0x41` 键盘 | 注入路径 `input_filter_inject_*`（过授权门控） |
+| **vctrl** (`-iface serial -proto vctrl`) | 串口 2M | TinyFrame `0xC0` 载荷 `[0xFC][0xFE/0xFC][args]` | 控制帧重放 `handle_control_frame` → `core_input_*`（无授权门控） |
+| **HID** (`-iface hid`) | PIO vendor HID OUT | 55 AA 帧 `0xFD` 键盘 / `0xFE` 鼠标 | `hid_dispatch_*` → `core_input_*` |
+
+三条路径最终都汇到 `core_input_keyboard / core_input_mouse_button`，所以测试流程
+（`~` 切映射、映射类型自检、触点匹配）完全一致；hurra 与后两者的区别在引擎入口
+（注入路径 vs 控制帧重放），HID 与 vctrl 的区别只在传输层（USB OUT vs UART）。
+旧的串口 55 AA 协议已随固件 2026-09-27 的「Hurra 单协议」改造删除。
 
 ---
 
@@ -53,9 +64,11 @@
 
 > 跑一下双 HID 的延迟测试，100 次
 
-AI 会按 `CLAUDE.md` 里的说明自动完成：检测设备 → 开启映射 → 自检映射类型 → 跑 100 轮 → 输出统计。串口模式则说：
+AI 会按 `CLAUDE.md` 里的说明自动完成：检测设备 → 开启映射 → 自检映射类型 → 跑 100 轮 → 输出统计。串口路径（默认 hurra 标准命令）则说：
 
 > 用串口跑 100 次延迟测试
+
+（要测 VCTRL 扩展或 HID 路径，把路径名带上即可。）
 
 ### 手动运行
 
@@ -66,8 +79,12 @@ go build -o hid_com_delay_test .
 ./hid_com_delay_test -iface hid -ctrl-vid 2e8a -ctrl-pid c9d0 \
     -target-vid 035f -target-pid 0ae8 -n 100
 
-# 串口控制 (CH343 接 Pico UART)
-./hid_com_delay_test -iface serial -serial /dev/ttyACM0 -baud 921600 \
+# 串口 Hurra 标准命令 (CH343 接 Pico UART, 2M 固定波特率)
+./hid_com_delay_test -iface serial -proto hurra -serial /dev/ttyACM0 \
+    -target-vid 0541 -target-pid 0ce5 -n 100
+
+# 串口 Hurra VCTRL 扩展 (0xC0 控制帧重放)
+./hid_com_delay_test -iface serial -proto vctrl -serial /dev/ttyACM0 \
     -target-vid 0541 -target-pid 0ce5 -n 100
 ```
 
@@ -80,8 +97,9 @@ go build -o hid_com_delay_test .
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `-iface` | `serial` | 控制接口：`serial` 或 `hid` |
+| `-proto` | `hurra` | 串口协议 (仅 `iface=serial` 有效)：`hurra` 标准 / `vctrl` 扩展 |
 | `-serial` | — | 串口路径 (如 `/dev/ttyACM0`)，`iface=serial` 必填 |
-| `-baud` | `921600` | 串口波特率 |
+| `-baud` | `2000000` | 串口波特率 (固件固定 2M，`0x05 BAUD` 命令只回 ACK 不改速) |
 | `-ctrl-vid` / `-ctrl-pid` | — | 控制 HID 设备 VID/PID，`iface=hid` 必填 |
 | `-report-id` | `0` | 控制 HID 写入的报告 ID |
 | `-target-vid` / `-target-pid` | `0541` / `0ce5` | 触屏设备 VID/PID |
@@ -90,6 +108,9 @@ go build -o hid_com_delay_test .
 | `-timeout` | `2000` | 单次等待报告超时 ms |
 | `-ws` | `ws://192.168.73.1:80/ws` | 设备日志地址 (用于确认映射开关状态) |
 | `-v` | `false` | 打印每条触屏报告原始内容 |
+
+串口模式启动时会做**链路自检**：发 TinyFrame `VERSION (0x01)` 并等待固件应答
+`"kmbox: Hurra v1"`，失败即报错退出（接错口/固件未刷/波特率不符时不再拖到测量阶段超时）。
 
 ### VID/PID 会变
 
@@ -165,6 +186,7 @@ print(ws.recv())"
 |------|-----------|
 | `未找到触屏设备 XXXX:XXXX` | VID/PID 不对，用上面的 `grep HID_ID` 命令确认 |
 | `无法打开触屏设备: permission denied` | udev 规则未生效，执行上面的规则并 `udevadm trigger` |
+| `串口链路自检失败` | 接错串口（应为设备 UART）、固件未刷 Hurra 版、波特率不是 2M 或串口被占用 |
 | `左键按下 2s 内未收到触屏报告` | 左键未映射到触屏区域 |
 | `检测到自发释放报告` | **映射类型错误**，改为「同步按下释放」类型 |
 | `无法确认映射模式已开启` | WS 不通或 `~` 键未触发；检查 `-ws` 地址与映射配置 |
@@ -174,30 +196,32 @@ print(ws.recv())"
 
 ## 📈 实测数据
 
-串口 vs HID 控制链路对比 (各 400 样本，Pi 5 主机)：见 [RESULTS.md](RESULTS.md)。
+HID vs 旧串口 55 AA 协议（已删除）的对比 (各 400 样本，Pi 5 主机)：见 [RESULTS.md](RESULTS.md)。
 
 | 链路 | 平均 | 中位 | 标准差 | P99 |
 |------|------|------|--------|-----|
 | HID 控制 | **1.029 ms** | 1.026 | **0.048** | 1.066 |
-| 串口 921600 | 1.559 ms | 1.577 | 0.338 | 2.018 |
+| 串口 921600 (旧协议) | 1.559 ms | 1.577 | 0.338 | 2.018 |
 
-HID 链路 97.5% 的样本落在 1.0–1.1 ms（即一个 USB 全速帧周期）内，延迟稳定；串口链路呈 0.8/1.4/1.8 ms 多层分布。
+HID 链路 97.5% 的样本落在 1.0–1.1 ms（即一个 USB 全速帧周期）内，延迟稳定；旧串口链路呈 0.8/1.4/1.8 ms 多层分布。
+
+> 旧数据基于已删除的 55 AA 串口协议 @921600。Hurra @2M 的三条路径新基线待补。
 
 ---
 
 ## 🔬 工作原理
 
 ```
-上位机 ──控制帧──> Pico (映射引擎) ──触屏 HID 报告──> 上位机 hidraw
+上位机 ──控制指令──> Pico (映射引擎) ──触屏 HID 报告──> 上位机 hidraw
    │ t0                                                    │ t1
    └──────────── 延迟 = t1 − t0 ─────────────────────────┘
 ```
 
-1. 定位触屏 hidraw 与控制链路 (均按 USB VID:PID 匹配 sysfs)
+1. 定位触屏 hidraw 与控制链路 (均按 USB VID:PID 匹配 sysfs)；串口路径先做 VERSION 自检
 2. 发送 `~` (KEY_GRAVE) 开启映射，通过设备 WS 日志 `map on (switch key 53)` 确认
 3. **映射类型自检**：按下左键静置 400ms，确认无自发释放
 4. 循环 `-n` 轮，每轮 4 个动作：左按下 → 右按下 → 左松开 → 右松开
-   (buttons 位掩码 `0x01 → 0x03 → 0x02 → 0x00`，每步恰好一个按键边沿)
+   (每步恰好一个按键边沿；HID 路径维护 55 AA 报文的按钮位图，串口路径逐按钮发命令)
 5. 每步记录写入完成时刻 t0，等待匹配的触屏报告 (触点 ID + tip 位 + 压力值匹配)，
    读取时刻 t1，延迟 = t1 − t0
 6. 关闭映射，输出统计
