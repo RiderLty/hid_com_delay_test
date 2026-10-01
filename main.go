@@ -20,9 +20,9 @@ import (
 // pico-hid-mapper 延迟测试工具
 //
 // 三条控制路径（固件侧最终都汇到 core_input_keyboard / core_input_mouse_button）：
-//   1. hurra 标准（串口 2M，TinyFrame 帧）：TYPE_BTN_LEFT/RIGHT (0x20/0x21) [state]、
+//   1. hurra 标准（串口 4M，TinyFrame 帧）：TYPE_BTN_LEFT/RIGHT (0x20/0x21) [state]、
 //      TYPE_KB_DOWN/UP (0x40/0x41) [key] —— 注入路径（input_filter_inject_*，过授权门控）
-//   2. hurra 扩展 VCTRL（串口 2M，TF type 0xC0）：payload [0xFC][0xFE][btn][down] /
+//   2. hurra 扩展 VCTRL（串口 4M，TF type 0xC0）：payload [0xFC][0xFE][btn][down] /
 //      [0xFC][0xFC][key][down] —— 固件重组 55 AA 帧重放 handle_control_frame（无授权门控）
 //   3. HID（PIO vendor HID OUT，55 AA 帧）：CMD 0xFD 键盘 / 0xFE 鼠标 —— hid_dispatch_*
 //
@@ -53,7 +53,7 @@ func main() {
 	iface := flag.String("iface", "serial", "控制接口: serial | hid")
 	proto := flag.String("proto", "hurra", "串口协议 (仅 iface=serial 有效): hurra 标准 | vctrl 扩展")
 	serialDev := flag.String("serial", "", "串口设备路径 (iface=serial 必填, 如 /dev/ttyACM0)")
-	baud := flag.Int("baud", 2000000, "串口波特率 (固件固定 2M, 0x05 BAUD 命令只回 ACK 不改速)")
+	baud := flag.Int("baud", 4000000, "串口波特率 (固件固定 4M, 0x05 BAUD 命令只回 ACK 不改速)")
 	ctrlVID := flag.String("ctrl-vid", "", "控制 HID 设备 VID, 4 位 hex (iface=hid 必填)")
 	ctrlPID := flag.String("ctrl-pid", "", "控制 HID 设备 PID, 4 位 hex (iface=hid 必填)")
 	reportID := flag.Int("report-id", 0, "控制 HID 写入的报告 ID")
@@ -154,7 +154,7 @@ func main() {
 		if err != nil {
 			sl.Close()
 			log.Fatalf("串口链路自检失败: %v\n"+
-				"  可能原因: 接错串口 (应为设备 UART, 2M 波特率)、固件未刷 Hurra 版、\n"+
+				"  可能原因: 接错串口 (应为设备 UART, 4M 波特率)、固件未刷 Hurra 版、\n"+
 				"  或串口被其他进程占用", err)
 		}
 		fmt.Printf("控制接口: 串口 %s @ %d (协议 %s)\n", *serialDev, *baud, *proto)
@@ -597,7 +597,7 @@ type cmdLink interface {
 	Close() error
 }
 
-// ----- 串口链路 (Hurra / TinyFrame, 固定 2M) -----
+// ----- 串口链路 (Hurra / TinyFrame, 固定 4M) -----
 
 type serialLink struct {
 	port   serial.Port

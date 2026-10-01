@@ -6,8 +6,8 @@
 
 | 路径 | 传输 | 线格式 | 固件引擎入口 |
 |------|------|--------|------|
-| **hurra** (`-iface serial -proto hurra`) | 串口 2M | TinyFrame `0x20/0x21` 鼠标按钮、`0x40/0x41` 键盘 | 注入路径 `input_filter_inject_*`（过授权门控） |
-| **vctrl** (`-iface serial -proto vctrl`) | 串口 2M | TinyFrame `0xC0` 载荷 `[0xFC][0xFE/0xFC][args]` | 控制帧重放 `handle_control_frame` → `core_input_*`（无授权门控） |
+| **hurra** (`-iface serial -proto hurra`) | 串口 4M | TinyFrame `0x20/0x21` 鼠标按钮、`0x40/0x41` 键盘 | 注入路径 `input_filter_inject_*`（过授权门控） |
+| **vctrl** (`-iface serial -proto vctrl`) | 串口 4M | TinyFrame `0xC0` 载荷 `[0xFC][0xFE/0xFC][args]` | 控制帧重放 `handle_control_frame` → `core_input_*`（无授权门控） |
 | **HID** (`-iface hid`) | PIO vendor HID OUT | 55 AA 帧 `0xFD` 键盘 / `0xFE` 鼠标 | `hid_dispatch_*` → `core_input_*` |
 
 三条路径最终都汇到 `core_input_keyboard / core_input_mouse_button`，所以测试流程
@@ -79,7 +79,7 @@ go build -o hid_com_delay_test .
 ./hid_com_delay_test -iface hid -ctrl-vid 2e8a -ctrl-pid c9d0 \
     -target-vid 035f -target-pid 0ae8 -n 100
 
-# 串口 Hurra 标准命令 (CH343 接 Pico UART, 2M 固定波特率)
+# 串口 Hurra 标准命令 (CH343 接 Pico UART, 4M 固定波特率)
 ./hid_com_delay_test -iface serial -proto hurra -serial /dev/ttyACM0 \
     -target-vid 0541 -target-pid 0ce5 -n 100
 
@@ -99,7 +99,7 @@ go build -o hid_com_delay_test .
 | `-iface` | `serial` | 控制接口：`serial` 或 `hid` |
 | `-proto` | `hurra` | 串口协议 (仅 `iface=serial` 有效)：`hurra` 标准 / `vctrl` 扩展 |
 | `-serial` | — | 串口路径 (如 `/dev/ttyACM0`)，`iface=serial` 必填 |
-| `-baud` | `2000000` | 串口波特率 (固件固定 2M，`0x05 BAUD` 命令只回 ACK 不改速) |
+| `-baud` | `4000000` | 串口波特率 (固件固定 4M，`0x05 BAUD` 命令只回 ACK 不改速) |
 | `-ctrl-vid` / `-ctrl-pid` | — | 控制 HID 设备 VID/PID，`iface=hid` 必填 |
 | `-report-id` | `0` | 控制 HID 写入的报告 ID |
 | `-target-vid` / `-target-pid` | `0541` / `0ce5` | 触屏设备 VID/PID |
@@ -186,7 +186,7 @@ print(ws.recv())"
 |------|-----------|
 | `未找到触屏设备 XXXX:XXXX` | VID/PID 不对，用上面的 `grep HID_ID` 命令确认 |
 | `无法打开触屏设备: permission denied` | udev 规则未生效，执行上面的规则并 `udevadm trigger` |
-| `串口链路自检失败` | 接错串口（应为设备 UART）、固件未刷 Hurra 版、波特率不是 2M 或串口被占用 |
+| `串口链路自检失败` | 接错串口（应为设备 UART）、固件未刷 Hurra 版、波特率不是 4M 或串口被占用 |
 | `左键按下 2s 内未收到触屏报告` | 左键未映射到触屏区域 |
 | `检测到自发释放报告` | **映射类型错误**，改为「同步按下释放」类型 |
 | `无法确认映射模式已开启` | WS 不通或 `~` 键未触发；检查 `-ws` 地址与映射配置 |
@@ -205,7 +205,7 @@ HID vs 旧串口 55 AA 协议（已删除）的对比 (各 400 样本，Pi 5 主
 
 HID 链路 97.5% 的样本落在 1.0–1.1 ms（即一个 USB 全速帧周期）内，延迟稳定；旧串口链路呈 0.8/1.4/1.8 ms 多层分布。
 
-> 旧数据基于已删除的 55 AA 串口协议 @921600。Hurra @2M 的三条路径新基线待补。
+> 旧数据基于已删除的 55 AA 串口协议 @921600。Hurra @4M 的三条路径新基线待补。
 
 ---
 

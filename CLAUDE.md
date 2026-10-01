@@ -8,7 +8,7 @@ A single-file Go CLI (`main.go`) that measures the end-to-end latency of a [pico
 
 Two links are involved:
 
-- **Control link** (sends commands): a USB serial port (`-iface serial`, e.g. CH343 CDC-ACM `/dev/ttyACM*`, fixed 2M baud) or the device's PIO HID interface (`-iface hid`, a vendor-defined 64-byte report with no report ID — hidraw write = `[0x00 report-id byte][frame]`).
+- **Control link** (sends commands): a USB serial port (`-iface serial`, e.g. CH343 CDC-ACM `/dev/ttyACM*`, fixed 4M baud) or the device's PIO HID interface (`-iface hid`, a vendor-defined 64-byte report with no report ID — hidraw write = `[0x00 report-id byte][frame]`).
 - **Touch output** (receives the reports being timed): the device's touch-screen HID interface, read directly via hidraw (`/dev/hidraw*`), NOT evdev. Report ID 1, 13 bytes: `[01][tip:bit0][contact_id:u8][pressure:u8][X:u32 LE][Y:u32 LE][count:u8]`.
 
 Both VID:PID pairs are configurable because the firmware can change them. Typical invocations:
@@ -20,7 +20,7 @@ Both VID:PID pairs are configurable because the firmware can change them. Typica
     -target-vid 0541 -target-pid 0ce5 -n 100    # -proto vctrl 测 VCTRL 扩展
 ```
 
-Other flags: `-proto` (serial only: `hurra` default | `vctrl`), `-baud` (default 2000000, firmware-fixed), `-timeout` (per-read ms), `-v` (print raw reports). hidraw access requires a udev rule (installed at `/etc/udev/rules.d/99-pico-hid-mapper.rules`, grants plugdev group for VIDs 035f and 2e8a) — update it when VIDs change.
+Other flags: `-proto` (serial only: `hurra` default | `vctrl`), `-baud` (default 4000000, firmware-fixed), `-timeout` (per-read ms), `-v` (print raw reports). hidraw access requires a udev rule (installed at `/etc/udev/rules.d/99-pico-hid-mapper.rules`, grants plugdev group for VIDs 035f and 2e8a) — update it when VIDs change.
 
 ## Commands
 
@@ -36,11 +36,11 @@ Running requires the hardware connected. The device also exposes WebSocket logs 
 
 三条路径最终都汇到 `core_input_keyboard / core_input_mouse_button`，测量流程共用；区别在引擎入口：
 
-1. **hurra 标准**（串口 2M，注入路径 `input_filter_inject_*`，过授权门控）：TinyFrame 帧
+1. **hurra 标准**（串口 4M，注入路径 `input_filter_inject_*`，过授权门控）：TinyFrame 帧
    `[ID:1][LEN:1][TYPE:1][头CRC16:2 BE][载荷][数据CRC16:2 BE]`，CRC poly 0x8005 反射、初值 0、
    CRC 字段大端，无 SOF 字节，`LEN==0` 帧到头 CRC 为止。鼠标按钮 TYPE `0x20..0x24`（左/右/中/
    后退/前进）载荷 `[state]`；键盘 `0x40/0x41`（KB_DOWN/UP）载荷 `[key]`。
-2. **hurra 扩展 VCTRL**（串口 2M，无授权门控）：TF type `0xC0`，载荷 `[0xFC][0xFE][btn][down]`
+2. **hurra 扩展 VCTRL**（串口 4M，无授权门控）：TF type `0xC0`，载荷 `[0xFC][0xFE][btn][down]`
    （→ `core_input_mouse_button`）或 `[0xFC][0xFC][key][down]`（→ `core_input_keyboard`）——
    固件重组 55 AA 帧重放 `handle_control_frame`。
 3. **HID**（PIO vendor HID OUT，`hid_dispatch_*`）：55 AA 帧 `[0x55][0xAA][LEN:u8][CMD:u8][payload]`，
